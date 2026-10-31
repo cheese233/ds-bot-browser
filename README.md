@@ -27,9 +27,10 @@ every Web page, before the app shell, and backs it on the host.
 ## Requirements
 
 * `dsh` with a Web profile.
-* **`xvfb`** (`apt install xvfb`) — required, not optional: without an X
-  display, Chromium's ANGLE/GL backend cannot start and WebGL falls back to
-  SwiftShader.
+* **`xvfb`** (`apt install xvfb`) — required for the shipped configuration:
+  without an X display, Chromium's ANGLE/GL backend cannot start and WebGL
+  falls back to SwiftShader. `DS_BOT_WEB_HEADLESS=1` runs without Xvfb for
+  comparison; that row is SwiftShader and its UA needs the override.
 * **Chromium/Chrome** (`google-chrome-stable` or set `executablePath`).
 * Node.js 22+.
 
@@ -69,7 +70,7 @@ every Web page, before the app shell, and backs it on the host.
 | item | value |
 |---|---|
 | WebGL renderer (shipped: Xvfb + `--headless=new` + GL flags) | `ANGLE (Mesa, llvmpipe (LLVM 21.1.8 256 bits), OpenGL 4.5)` |
-| WebGL renderer (no Xvfb, any GL/env combination) | `SwiftShader` |
+| WebGL renderer with `DS_BOT_WEB_HEADLESS=1` (no Xvfb) | `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` |
 | `navigator.webdriver` | `false` (rebrowser `AutomationControlled` patch) |
 | User agent | `Chrome/156.0.0.0`, no `HeadlessChrome` |
 | Capture / encoded video | 800×600 display, 800×450 encoded @30 fps |

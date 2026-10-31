@@ -104,7 +104,8 @@ async function start(ctx, config) {
   const executablePath = config.executablePath ?? process.env.DS_BOT_WEB_CHROME ?? DEFAULT_CHROME
   const idleMs = Number.isFinite(config.idleMinutes) ? Math.max(1, config.idleMinutes) * 60_000 : 5 * 60_000
   const quality = Number.isFinite(config.quality) ? Math.min(95, Math.max(20, config.quality)) : 72
-  const capture = viewportOf(config.capture, { width: 800, height: 600 })
+  const capture = viewportOf(config.capture, { width: 1280, height: 800 })
+  const screen = viewportOf(config.screen, { width: 1920, height: 1080 })
   const stateRoot = config.profileRoot ?? join(process.env.DSH_HOME ?? '/root/.dsh', 'bot', 'state', 'browser')
 
   const bridgeFile = BRIDGES[mode]
@@ -172,7 +173,9 @@ async function start(ctx, config) {
       number = 90 + (displaySerial++ % 60)
       if (!existsSync(`/tmp/.X11-unix/X${number}`)) break
     }
-    const proc = spawn('Xvfb', [`:${number}`, '-screen', '0', `${capture.width}x${capture.height}x24`, '-nolisten', 'tcp'], { stdio: 'ignore' })
+    // The display is a normal 1920x1080 screen; the window inside it is the
+    // capture size. Keeping them different is what makes `screen` believable.
+    const proc = spawn('Xvfb', [`:${number}`, '-screen', '0', `${screen.width}x${screen.height}x24`, '-nolisten', 'tcp'], { stdio: 'ignore' })
     proc.on('exit', () => ctx.logger?.warn?.('ds-bot-web-browser: Xvfb :%s exited', number))
     if (!await waitFor(() => existsSync(`/tmp/.X11-unix/X${number}`), 5000)) {
       proc.kill('SIGKILL')
@@ -371,14 +374,14 @@ async function start(ctx, config) {
     const context = await launchProfile(chromium, userDataDir, {
       executablePath,
       headless: !headed,
-      userAgent: UA,
+      ...headed ? {} : { userAgent: UA },
       chromiumSandbox: false,
       // A context viewport would shrink `screen` to the window size, which is a
       // fingerprint of its own: let --window-size size the window instead.
       viewport: null,
       ...headed ? { env: { ...process.env, DISPLAY: `:${display.number}` } } : {},
       args: headed
-        ? [...CHROME_FLAGS, ...HEADED_FLAGS, '--headless=new', `--window-size=${view.width},${view.height}`, '--window-position=0,0']
+        ? [...CHROME_FLAGS, ...HEADED_FLAGS, `--window-size=${view.width},${view.height}`, '--window-position=0,0']
         : [...CHROME_FLAGS, `--window-size=${view.width},${view.height}`],
       acceptDownloads: false,
     })
