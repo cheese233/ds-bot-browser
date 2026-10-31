@@ -72,12 +72,13 @@ every Web page, before the app shell, and backs it on the host.
 | WebGL renderer (shipped: Xvfb + `--headless=new` + GL flags) | `ANGLE (Mesa, llvmpipe (LLVM 21.1.8 256 bits), OpenGL 4.5)` |
 | WebGL renderer with `DS_BOT_WEB_HEADLESS=1` (no Xvfb) | `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` |
 | `navigator.webdriver` | `false` (rebrowser `AutomationControlled` patch) |
-| User agent | `Chrome/156.0.0.0`, no `HeadlessChrome` |
-| Capture / encoded video | 800×600 display, 800×450 encoded @30 fps |
+| User agent | `Chrome/156.0.0.0`, no `HeadlessChrome` (overridden; brands stay Chromium/Google Chrome 156) |
+| `screen` / `outerWidth` | 800×600 / 800×600 (see the residual tells below) |
+| Capture / encoded video | 800×600 capture, 800×450 encoded @30 fps |
 | Codec chosen | `video/webm;codecs=vp8` (MSE-safe); MP4/H.264 is offered but MediaRecorder's MP4 did not demux in MSE in testing |
-| Bitrate under motion | 234–288 kbps (~3.5 chunks/s) — compared with CDP JPEG at several MB/s |
-| Panel render rate | ~10–30 fps (only when the page changes; a static page holds its last frame) |
-| Memory, two Bots open | Chromium ≈ 728 MiB PSS, Xvfb ≈ 48 MiB PSS |
+| Bitrate under motion | 283–311 kbps (~3.5 chunks/s) — against CDP JPEG at several MB/s |
+| Panel render rate | 8.5–10.8 fps measured (only when the page changes; a static page holds its last frame) |
+| Memory, two Bots open | Chromium ≈ 826 MiB PSS, Xvfb ≈ 30 MiB PSS |
 
 ## Text input
 

@@ -237,14 +237,15 @@
 
   /** Client pixels -> page pixels, undoing the letterboxing of object-fit: contain. */
   const toPage = (view, event) => {
-    const rect = view.video.getBoundingClientRect()
-    const [captureWidth, captureHeight] = view.captureSize ?? [rect.width, rect.height]
-    const scale = Math.min(rect.width / captureWidth, rect.height / captureHeight)
-    const offsetX = (rect.width - captureWidth * scale) / 2
-    const offsetY = (rect.height - captureHeight * scale) / 2
+    const wrap = view.wrap.getBoundingClientRect()
+    const scale = view.scale ?? 1
+    const box = view.box ?? { width: wrap.width, height: wrap.height }
+    const win = view.window ?? { width: box.width, height: box.height }
+    const offsetX = (box.width - win.width * scale) / 2
+    const offsetY = (box.height - win.height * scale) / 2
     return {
-      x: Math.round((event.clientX - rect.left - offsetX) / scale),
-      y: Math.round((event.clientY - rect.top - offsetY) / scale),
+      x: Math.round((event.clientX - wrap.left - offsetX) / scale),
+      y: Math.round((event.clientY - wrap.top - offsetY) / scale),
     }
   }
 
@@ -337,6 +338,26 @@
   }
 
   // ---- placement --------------------------------------------------------
+  /** Show only the Bot window's rectangle of the captured screen. */
+  const layoutVideo = (view) => {
+    const box = view.box
+    if (box === null || box === undefined) return
+    const frameW = view.video.videoWidth
+    const frameH = view.video.videoHeight
+    if (frameW === 0 || frameH === 0) return
+    const win = view.window ?? { width: frameW, height: frameH }
+    const scale = Math.min(box.width / win.width, box.height / win.height)
+    view.scale = scale
+    Object.assign(view.video.style, {
+      position: 'absolute',
+      left: `${Math.round((box.width - win.width * scale) / 2)}px`,
+      top: `${Math.round((box.height - win.height * scale) / 2)}px`,
+      width: `${Math.round(frameW * scale)}px`,
+      height: `${Math.round(frameH * scale)}px`,
+      objectFit: 'fill',
+    })
+  }
+
   const applyPlacement = (view, visible) => {
     const box = view.box
     const shown = visible === true && box !== null && box !== undefined
@@ -359,6 +380,7 @@
       }
       return
     }
+    layoutVideo(view)
     if (view.pausedByPanel === true) {
       view.pausedByPanel = false
       send(view, { type: 'resume' })
@@ -378,7 +400,7 @@
     view.video.muted = true
     view.video.autoplay = true
     view.video.playsInline = true
-    Object.assign(view.video.style, { display: 'block', width: '100%', height: '100%', objectFit: 'contain', background: '#111' })
+    Object.assign(view.video.style, { display: 'block', width: '100%', height: '100%', background: '#111' })
     view.sink = document.createElement('textarea')
     view.badge = document.createElement('div')
     view.badge.className = 'ds-bot-web-browser-cost'
@@ -400,6 +422,7 @@
       view.videoFrame = view.video.requestVideoFrameCallback(count)
     }
     if (typeof view.video.requestVideoFrameCallback === 'function') view.videoFrame = view.video.requestVideoFrameCallback(count)
+    view.video.addEventListener('loadedmetadata', () => layoutVideo(view))
   }
 
   const historyPush = (view, url) => {

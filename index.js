@@ -373,20 +373,34 @@ async function start(ctx, config) {
     await mkdir(userDataDir, { recursive: true })
     const context = await launchProfile(chromium, userDataDir, {
       executablePath,
-      headless: !headed,
-      ...headed ? {} : { userAgent: UA },
+      headless: false,
+      // --headless=new still says HeadlessChrome; override the UA (and only the
+      // UA: a locale override makes page and worker languages disagree).
+      userAgent: UA,
       chromiumSandbox: false,
       // A context viewport would shrink `screen` to the window size, which is a
       // fingerprint of its own: let --window-size size the window instead.
       viewport: null,
       ...headed ? { env: { ...process.env, DISPLAY: `:${display.number}` } } : {},
-      args: headed
-        ? [...CHROME_FLAGS, ...HEADED_FLAGS, `--window-size=${view.width},${view.height}`, '--window-position=0,0']
-        : [...CHROME_FLAGS, `--window-size=${view.width},${view.height}`],
+      args: [...CHROME_FLAGS, ...HEADED_FLAGS, '--headless=new', `--window-size=${view.width},${view.height}`, '--window-position=0,0'],
       acceptDownloads: false,
     })
     const pages = context.pages()
     const page = pages[0] ?? await context.newPage()
+    // The persisted profile restores its own window bounds, which would ignore
+    // --window-size (and with it the capture resolution).
+    try {
+      const session = await context.newCDPSession(page)
+      const { windowId } = await session.send('Browser.getWindowForTarget')
+      await session.send('Browser.setWindowBounds', {
+        windowId,
+        bounds: { width: view.width, height: view.height, windowState: 'normal' },
+      })
+      const check = await session.send('Browser.getWindowBounds', { windowId })
+      ctx.logger?.info?.('ds-bot-web-browser: window pinned to %dx%d (was %s)', view.width, view.height, JSON.stringify(check.bounds))
+    } catch (error) {
+      ctx.logger?.warn?.('ds-bot-web-browser: could not pin the window size: %s', error?.message ?? error)
+    }
     const cdp = await context.newCDPSession(page)
     await cdp.send('Page.enable').catch(() => {})
     const entry = {
@@ -578,7 +592,7 @@ async function start(ctx, config) {
       await startCapture(botId, entry, String(body?.wsUrl ?? '')).catch((error) => {
         ctx.logger?.warn?.('ds-bot-web-browser: capture did not start: %s', error?.message ?? error)
       })
-      return respond({ ok: true, ...state, live: true })
+      return respond({ ok: true, ...state, live: true, window: { width: entry.view.width, height: entry.view.height } })
     }
     if (op === 'ensure') {
       const wanted = typeof body?.url === 'string' ? body.url : ''
@@ -589,7 +603,7 @@ async function start(ctx, config) {
       await startCapture(botId, entry, String(body?.wsUrl ?? '')).catch((error) => {
         ctx.logger?.warn?.('ds-bot-web-browser: capture did not start: %s', error?.message ?? error)
       })
-      return respond({ ok: true, ...state })
+      return respond({ ok: true, ...state, window: { width: entry.view.width, height: entry.view.height } })
     }
     if (op === 'navigate') return respond({ ok: true, ...await navigate(entry, body?.url) })
     if (op === 'state') return respond({ ok: true, url: entry.page.url(), title: await entry.page.title().catch(() => ''), live: true })
@@ -648,6 +662,10 @@ async function start(ctx, config) {
   const sweeper = setInterval(async () => {
     try {
       const now = Date.now()
+      // A display whose Bot is gone must not outlive it.
+      for (const botId of [...displays.keys()]) {
+        if (!bots.has(botId)) stopDisplay(botId)
+      }
       for (const [botId, entry] of [...bots]) {
         const channel = channels.get(botId)
         if (channel !== undefined && channel.viewers.size > 0) continue
