@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DS Bot browser capture</title>
+<style>html,body{margin:0;background:#111;color:#ddd;font:13px/1.5 system-ui,sans-serif}main{padding:12px}</style>
+</head>
+<body>
+<main>
+  <div id="state">starting…</div>
+  <div id="detail"></div>
+</main>
+<script>
+// Capture agent: records this Bot's display and pushes encoded chunks to the
+// dsh host over a WebSocket. It must run on a secure origin (127.0.0.1 is one)
+// because getDisplayMedia and navigator.mediaDevices are secure-context only.
+(() => {
+  const params = new URLSearchParams(location.search)
+  const botId = params.get('bot') ?? ''
+  const token = params.get('token') ?? ''
+  const wsUrl = params.get('ws') ?? ''
+  const width = Number(params.get('w') ?? 1280)
+  const height = Number(params.get('h') ?? 800)
+
+  const show = (text) => { document.getElementById('state').textContent = text }
+  const detail = (text) => { document.getElementById('detail').textContent = text }
+
+  // Preference order: MP4/H.264 first (smallest at this rate), then WebM.
+  // MP4/H.264 first (smallest at this rate), then WebM. MediaRecorder can emit
+  // MP4 that MSE cannot demux, so the panel may ask to rotate to the next one.
+  // WebM/VP8 first: MSE demuxes MediaRecorder's WebM reliably, while its MP4
+  // output is often not streamable. MP4 stays as a later candidate.
+  const CANDIDATES = [
+    'video/webm;codecs=vp8',
+    'video/webm;codecs=vp9',
+    'video/mp4;codecs=avc1.42E01E',
+  ]
+  let candidateAt = 0
+
+  let socket
+  let mediaSourceStream
+  let recorder
+  let paused = false
+  let frames = 0
+  let bytes = 0
+  let windowFrames = 0
+  let windowBytes = 0
+  let windowStart = Date.now()
+
+  const open = () => {
+    if (wsUrl === '') { show('no websocket address'); return }
+    const url = `${wsUrl}?token=${encodeURIComponent(token)}`
+    socket = new WebSocket(url)
+    socket.binaryType = 'arraybuffer'
+    socket.onopen = () => { show('capturing'); void start() }
+    socket.onclose = () => { show('socket closed'); void stop() }
+    socket.onerror = () => { show('socket error') }
+    socket.onmessage = (event) => {
+      let message = {}
+      try { message = JSON.parse(String(event.data)) } catch { return }
+      if (message.type === 'pause') { paused = true
+        document.body.style.visibility = 'visible' }
+      else if (message.type === 'resume') paused = false
+      else if (message.type === 'stop') void stop()
+      else if (message.type === 'retry') void rotate()
+    }
+  }
+
+  const start = async () => {
+    try {
+      if (typeof navigator.mediaDevices?.getDisplayMedia !== 'function') {
+        throw new Error('getDisplayMedia is unavailable (not a secure context?)')
+      }
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 30 } })
+      mediaSourceStream = stream
+      const track = stream.getVideoTracks()[0]
+      const settings = track.getSettings()
+      const rest = [...CANDIDATES.slice(candidateAt), ...CANDIDATES.slice(0, candidateAt)]
+      const chosen = rest.find((type) => typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(type))
+      if (chosen === undefined) throw new Error('no supported recording codec')
+      recorder = new MediaRecorder(stream, { mimeType: chosen, videoBitsPerSecond: 1_200_000 })
+      socket.send(JSON.stringify({
+        type: 'format', mimeType: chosen,
+        width: settings.width ?? width, height: settings.height ?? height,
+        deviceId: settings.deviceId ?? null, surface: settings.displaySurface ?? null,
+        frameRate: settings.frameRate ?? null,
+      }))
+      recorder.ondataavailable = async (event) => {
+        if (event.data.size === 0 || socket?.readyState !== 1) return
+        frames += 1
+        bytes += event.data.size
+        windowFrames += 1
+        windowBytes += event.data.size
+        if (paused) return
+        socket.send(await event.data.arrayBuffer())
+      }
+      recorder.start(250)
+      track.addEventListener('ended', () => void stop())
+      detail(`codec ${chosen} · ${settings.width ?? '?'}×${settings.height ?? '?'}`)
+      setInterval(() => {
+        if (socket?.readyState !== 1) return
+        const seconds = Math.max(0.001, (Date.now() - windowStart) / 1000)
+        socket.send(JSON.stringify({
+          type: 'stats',
+          chunksPerSecond: Math.round((windowFrames / seconds) * 10) / 10,
+          kbps: Math.round((windowBytes * 8) / 1000 / seconds),
+          chunks: frames, bytes,
+          mimeType: chosen,
+        }))
+        windowFrames = 0
+        windowBytes = 0
+        windowStart = Date.now()
+      }, 2000)
+    } catch (error) {
+      show(`capture failed: ${error?.name ?? ''} ${error?.message ?? error}`)
+      try { socket?.send(JSON.stringify({ type: 'error', error: String(error?.message ?? error) })) } catch {}
+    }
+  }
+
+  // The panel saw no decoded frames: try the next codec.
+  const rotate = async () => {
+    candidateAt = (candidateAt + 1) % CANDIDATES.length
+    try { recorder?.state !== 'inactive' && recorder?.stop() } catch {}
+    try { mediaSourceStream?.getTracks().forEach((track) => track.stop()) } catch {}
+    recorder = undefined
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    if (socket?.readyState === 1) await start()
+  }
+
+  const stop = async () => {
+    try { recorder?.state !== 'inactive' && recorder?.stop() } catch {}
+    try { mediaSourceStream?.getTracks().forEach((track) => track.stop()) } catch {}
+    try { socket?.close() } catch {}
+  }
+
+  // getDisplayMedia wants a user gesture in some builds; the launch flags make
+  // the picker automatic, but a synthetic activation keeps it reliable.
+  document.addEventListener('click', () => { if (socket === undefined) open() }, { once: true })
+  open()
+})()
+</script>
+</body>
+</html>

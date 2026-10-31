@@ -1,0 +1,8 @@
+# Add under your profile patch (cordis.patch.yml) to enable the Bot browser
+# panel. See README.md for the full steps.
+- insert:
+    - id: ds-bot-web-browser
+      name: "@local/ds-bot-web-browser"
+- id: bot
+  config:
+    browser: true

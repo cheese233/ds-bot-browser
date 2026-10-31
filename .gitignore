@@ -1,0 +1,13 @@
+node_modules/
+state/
+*.png
+*.jpg
+*.log
+exp-*.mjs
+verify-*.mjs
+evidence.mjs
+probe-*.mjs
+diag-*.mjs
+hold-*.mjs
+wsprobe.mjs
+*.bak-*
