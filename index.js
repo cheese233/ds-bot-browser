@@ -292,7 +292,7 @@ async function start(ctx, config) {
         mode,
         build: 'video-1',
         chrome: executablePath,
-        capture,
+        capture: captureSize,
         stateRoot,
         bots: host.list(),
         display: host.display === undefined ? null : `:${host.display.number}`,
@@ -451,5 +451,5 @@ async function start(ctx, config) {
     })()
   }, 'ds-bot-web-browser: browsers')
 
-  ctx.logger?.info?.('ds-bot-web-browser: mode=%s bridge=%s chrome=%s capture=%dx%d quality=%d', mode, bridgeFile, executablePath, capture.width, capture.height, quality)
+  ctx.logger?.info?.('ds-bot-web-browser: mode=%s bridge=%s chrome=%s capture=%dx%d quality=%d', mode, bridgeFile, executablePath, captureSize.width, captureSize.height, quality)
 }
