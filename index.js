@@ -37,28 +37,7 @@ const TICKET_MS = 60_000
 // Headed Chromium on our own Xvfb display: headless can only ever give
 // SwiftShader for WebGL, and its UA says HeadlessChrome. xvfb is therefore a
 // required dependency (apt install xvfb).
-export const CHROME_FLAGS = [
-  '--no-sandbox',
-  '--disable-dev-shm-usage',
-  '--use-fake-ui-for-media-stream',
-  '--use-fake-device-for-media-stream',
-  '--autoplay-policy=no-user-gesture-required',
-  '--mute-audio',
-  '--disable-blink-features=AutomationControlled',
-]
-
-/** Extra flags that only matter on a real X display (llvmpipe over ANGLE/GL). */
-export const HEADED_FLAGS = [
-  '--use-gl=angle',
-  '--use-angle=gl',
-  '--ignore-gpu-blocklist',
-  '--enable-gpu-rasterization',
-]
-
-// --headless=new inside Xvfb keeps the EGL display (so llvmpipe) while running
-// without a visible window. Its UA still says HeadlessChrome, so the context
-// overrides the UA — and only the UA, never locale.
-export const UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36'
+// Chromium flags, the extension and the capture pipeline live in browser.js.
 
 const here = dirname(fileURLToPath(import.meta.url))
 
@@ -104,8 +83,7 @@ async function start(ctx, config) {
   const executablePath = config.executablePath ?? process.env.DS_BOT_WEB_CHROME ?? DEFAULT_CHROME
   const idleMs = Number.isFinite(config.idleMinutes) ? Math.max(1, config.idleMinutes) * 60_000 : 5 * 60_000
   const quality = Number.isFinite(config.quality) ? Math.min(95, Math.max(20, config.quality)) : 72
-  const capture = viewportOf(config.capture, { width: 1280, height: 800 })
-  const screen = viewportOf(config.screen, { width: 1920, height: 1080 })
+  const captureSize = viewportOf(config.capture, { width: 800, height: 600 })
   const stateRoot = config.profileRoot ?? join(process.env.DSH_HOME ?? '/root/.dsh', 'bot', 'state', 'browser')
 
   const bridgeFile = BRIDGES[mode]
@@ -139,7 +117,7 @@ async function start(ctx, config) {
   }
   await reapOrphanDisplays()
 
-  /** botId -> live browser entry */
+  /** botId -> { lastUsed } bookkeeping; the browser lives in BrowserHost */
   const bots = new Map()
   const tickets = new Map()
   /** botId -> { viewers:Set<ws>, agent, agentToken, format } */
@@ -154,66 +132,55 @@ async function start(ctx, config) {
     return channel
   }
 
-  // ---- Xvfb per Bot ------------------------------------------------------
-  const displays = new Map()
-  let displaySerial = 0
-  const waitFor = async (probe, timeoutMs) => {
-    const started = Date.now()
-    while (Date.now() - started < timeoutMs) {
-      if (probe()) return true
-      await new Promise((resolve) => setTimeout(resolve, 100))
-    }
-    return false
+  // ---- browsers: one shared Xvfb, one headed Chromium per Bot ------------
+  const { BrowserHost } = await import('./browser.js')
+  const host = new BrowserHost({
+    chromePath: executablePath,
+    stateRoot,
+    extensionDir: join(here, 'extension'),
+    capture: captureSize,
+    log: (message) => ctx.logger?.info?.('ds-bot-web-browser: %s', message),
+  })
+  let hostStarted
+  const ensureHost = async () => {
+    if (hostStarted === undefined) hostStarted = host.start()
+    await hostStarted
+    return host
   }
-  async function displayFor(botId) {
-    const existing = displays.get(botId)
-    if (existing !== undefined) return existing
-    let number = 0
-    for (let attempt = 0; attempt < 40; attempt += 1) {
-      number = 90 + (displaySerial++ % 60)
-      if (!existsSync(`/tmp/.X11-unix/X${number}`)) break
-    }
-    // The display is a normal 1920x1080 screen; the window inside it is the
-    // capture size. Keeping them different is what makes `screen` believable.
-    const proc = spawn('Xvfb', [`:${number}`, '-screen', '0', `${screen.width}x${screen.height}x24`, '-nolisten', 'tcp'], { stdio: 'ignore' })
-    proc.on('exit', () => ctx.logger?.warn?.('ds-bot-web-browser: Xvfb :%s exited', number))
-    if (!await waitFor(() => existsSync(`/tmp/.X11-unix/X${number}`), 5000)) {
-      proc.kill('SIGKILL')
-      throw new Error(`Xvfb :${number} did not start`)
-    }
-    const entry = { proc, number }
-    displays.set(botId, entry)
-    return entry
-  }
-  function stopDisplay(botId) {
-    const entry = displays.get(botId)
-    if (entry === undefined) return
-    displays.delete(botId)
-    entry.proc.kill('SIGTERM')
+  const botFor = async (botId) => {
+    await ensureHost()
+    return await host.bot(botId)
   }
 
-  // ---- capture agent page (127.0.0.1 is a secure context) ----------------
-  const agentHtml = await readFile(join(here, 'agent.html'), 'utf8')
-  const agentServer = createServer((request, response) => {
-    let path = '/'
-    try {
-      path = new URL(request.url ?? '/', 'http://127.0.0.1').pathname
-    } catch {}
-    if (path !== '/agent.html') {
-      response.writeHead(404).end()
-      return
+  async function navigate(botId, url) {
+    const target = targetOf(url)
+    await botFor(botId)
+    const state = await host.navigate(botId, target)
+    bots.set(botId, { lastUsed: Date.now() })
+    return state
+  }
+
+  async function startCapture(botId, wsUrl) {
+    await botFor(botId)
+    const channel = channelOf(botId)
+    if (channel.agent !== undefined) return
+    await host.capture(botId, {
+      wsUrl,
+      token: channel.agentToken,
+      mimeTypes: ['video/webm;codecs=vp8', 'video/webm;codecs=vp9'],
+    })
+  }
+
+  async function closeBot(botId, { removeProfile = false } = {}) {
+    const channel = channels.get(botId)
+    for (const viewer of channel?.viewers ?? []) {
+      try {
+        viewer.send(JSON.stringify({ type: 'closed', message: removeProfile ? 'This Bot browser was reset.' : 'This browser closed.' }))
+      } catch {}
     }
-    response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
-    response.end(agentHtml)
-  })
-  await new Promise((resolve, reject) => {
-    agentServer.once('error', reject)
-    agentServer.listen(0, '127.0.0.1', resolve)
-  })
-  const agentPort = agentServer.address().port
-  const agentUrl = (botId, wsUrl) => `http://127.0.0.1:${agentPort}/agent.html`
-    + `?bot=${encodeURIComponent(botId)}&token=${encodeURIComponent(channelOf(botId).agentToken)}`
-    + `&ws=${encodeURIComponent(wsUrl)}&w=${capture.width}&h=${capture.height}`
+    bots.delete(botId)
+    await host.closeBot(botId, { removeProfile })
+  }
 
   // ---- WebSocket hub -----------------------------------------------------
   const wss = new WebSocketServer({ noServer: true })
@@ -305,225 +272,9 @@ async function start(ctx, config) {
     }), 'ds-bot-web-browser: capture socket')
   })
 
-  // ---- Chromium per Bot --------------------------------------------------
-  let chromiumModule
-  const chromiumOf = async () => {
-    if (chromiumModule === undefined) {
-      const loaded = await import('rebrowser-playwright-core')
-      chromiumModule = loaded.chromium ?? loaded.default?.chromium
-      if (chromiumModule === undefined) throw new Error('rebrowser-playwright-core has no chromium export')
-    }
-    return chromiumModule
-  }
-
-  // Shipped default: headed on our own Xvfb (llvmpipe + honest UA).
-  // DS_BOT_WEB_HEADLESS=1 exists only to measure the headless/SwiftShader row.
-  // Shipped default is headed on Xvfb (llvmpipe + honest UA). Set
-  // DS_BOT_WEB_HEADLESS=1 for the pure-headless comparison row: it needs no
-  // Xvfb but WebGL falls back to SwiftShader and the UA must be overridden.
-  const headedMode = () => process.env.DS_BOT_WEB_HEADLESS !== '1'
-
-  /** A persistent profile blocks a second launch until the old lock is gone. */
-  async function launchProfile(chromium, userDataDir, options) {
-    try {
-      return await chromium.launchPersistentContext(userDataDir, options)
-    } catch (error) {
-      const message = String(error?.message ?? error)
-      if (!/existing browser session|SingletonLock|ProcessSingleton|Failed to create/i.test(message)) throw error
-      ctx.logger?.warn?.('ds-bot-web-browser: clearing a stale profile lock for %s', userDataDir)
-      for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket', 'lockfile']) {
-        await rm(join(userDataDir, name), { force: true }).catch(() => {})
-      }
-      await killByProfile(userDataDir)
-      return await chromium.launchPersistentContext(userDataDir, options)
-    }
-  }
-
-  /** Last resort: kill a Chromium still holding this profile (a killed process). */
-  async function killByProfile(userDataDir) {
-    try {
-      const { execFile } = await import('node:child_process')
-      const listing = await new Promise((resolve) => {
-        execFile('ps', ['-eo', 'pid,args'], (error, stdout) => resolve(error === null ? stdout : ''))
-      })
-      for (const line of listing.split('\n')) {
-        if (!line.includes(userDataDir)) continue
-        const pid = Number(line.trim().split(/\s+/)[0])
-        if (Number.isInteger(pid) && pid > 1) {
-          try { process.kill(pid, 'SIGTERM') } catch {}
-        }
-      }
-      await new Promise((resolve) => setTimeout(resolve, 800))
-    } catch (error) {
-      ctx.logger?.warn?.('ds-bot-web-browser: profile cleanup failed: %s', error?.message ?? error)
-    }
-  }
-
-  async function botFor(botId, size) {
-    const existing = bots.get(botId)
-    if (existing !== undefined) {
-      existing.lastUsed = Date.now()
-      return existing
-    }
-    const view = viewportOf(size ?? capture, capture)
-    const headed = headedMode()
-    const display = headed ? await displayFor(botId) : undefined
-    const chromium = await chromiumOf()
-    const userDataDir = join(stateRoot, botId)
-    await mkdir(userDataDir, { recursive: true })
-    const context = await launchProfile(chromium, userDataDir, {
-      executablePath,
-      headless: false,
-      // --headless=new still says HeadlessChrome; override the UA (and only the
-      // UA: a locale override makes page and worker languages disagree).
-      userAgent: UA,
-      chromiumSandbox: false,
-      // A context viewport would shrink `screen` to the window size, which is a
-      // fingerprint of its own: let --window-size size the window instead.
-      viewport: null,
-      ...headed ? { env: { ...process.env, DISPLAY: `:${display.number}` } } : {},
-      args: [...CHROME_FLAGS, ...HEADED_FLAGS, '--headless=new', `--window-size=${view.width},${view.height}`, '--window-position=0,0'],
-      acceptDownloads: false,
-    })
-    const pages = context.pages()
-    const page = pages[0] ?? await context.newPage()
-    // The persisted profile restores its own window bounds, which would ignore
-    // --window-size (and with it the capture resolution).
-    try {
-      const session = await context.newCDPSession(page)
-      const { windowId } = await session.send('Browser.getWindowForTarget')
-      await session.send('Browser.setWindowBounds', {
-        windowId,
-        bounds: { width: view.width, height: view.height, windowState: 'normal' },
-      })
-      const check = await session.send('Browser.getWindowBounds', { windowId })
-      ctx.logger?.info?.('ds-bot-web-browser: window pinned to %dx%d (was %s)', view.width, view.height, JSON.stringify(check.bounds))
-    } catch (error) {
-      ctx.logger?.warn?.('ds-bot-web-browser: could not pin the window size: %s', error?.message ?? error)
-    }
-    const cdp = await context.newCDPSession(page)
-    await cdp.send('Page.enable').catch(() => {})
-    const entry = {
-      context, page, cdp, display, headed, userDataDir,
-      url: 'about:blank', title: '', lastUsed: Date.now(), navigating: undefined,
-      capturePage: undefined, view,
-    }
-    bots.set(botId, entry)
-    return entry
-  }
-
-  async function startCapture(botId, entry, wsUrl) {
-    if (wsUrl === undefined || wsUrl === '') throw new Error('The panel did not name its WebSocket origin.')
-    const channel = channelOf(botId)
-    if (channel.agent !== undefined) return
-    const capturePage = entry.capturePage ?? await entry.context.newPage()
-    entry.capturePage = capturePage
-    await capturePage.goto(agentUrl(botId, wsUrl), { waitUntil: 'domcontentloaded', timeout: 15_000 })
-    // Keep the Bot's page in front: the capture is of this Bot's display, and
-    // whatever is visible there is what the panel must show.
-    await entry.page.bringToFront().catch(() => {})
-  }
-
-  async function navigate(entry, url) {
-    const target = targetOf(url)
-    if (entry.navigating !== undefined) await entry.navigating.catch(() => {})
-    const current = entry.page.url()
-    if (current === target) {
-      entry.url = current
-      entry.title = await entry.page.title().catch(() => '')
-      return { url: entry.url, title: entry.title }
-    }
-    const job = entry.page.goto(target, { waitUntil: 'domcontentloaded', timeout: 25_000 })
-    entry.navigating = job
-    try {
-      await job
-    } catch (error) {
-      const message = String(error?.message ?? error)
-      if (!/ERR_ABORTED|Target (page, context or browser )?closed|has been closed/i.test(message)) throw error
-    } finally {
-      if (entry.navigating === job) entry.navigating = undefined
-    }
-    if (entry.page.url() === 'about:blank' && target !== 'about:blank') {
-      await entry.page.goto(target, { waitUntil: 'domcontentloaded', timeout: 25_000 }).catch(() => {})
-    }
-    entry.url = entry.page.url() || target
-    entry.title = await entry.page.title().catch(() => '')
-    entry.lastUsed = Date.now()
-    return { url: entry.url, title: entry.title }
-  }
-
-  async function closeBot(botId, { removeProfile = false } = {}) {
-    const entry = bots.get(botId)
-    const channel = channels.get(botId)
-    for (const viewer of channel?.viewers ?? []) {
-      try {
-        viewer.send(JSON.stringify({ type: 'closed', message: removeProfile ? 'This Bot browser was reset.' : 'This browser closed.' }))
-      } catch {}
-    }
-    if (channel?.agent !== undefined) {
-      try { channel.agent.close() } catch {}
-      channel.agent = undefined
-    }
-    bots.delete(botId)
-    if (entry !== undefined) await entry.context.close().catch(() => {})
-    stopDisplay(botId)
-    if (removeProfile) await rm(join(stateRoot, botId), { recursive: true, force: true }).catch(() => {})
-  }
-
   // ---- input -------------------------------------------------------------
   async function applyInput(botId, events) {
-    const entry = bots.get(botId)
-    if (entry === undefined) return
-    for (const event of Array.isArray(events) ? events.slice(0, 200) : []) {
-      const kind = String(event?.op ?? '')
-      try {
-        if (kind === 'mouse') {
-          const type = event.type === 'down' ? 'mousePressed' : event.type === 'up' ? 'mouseReleased' : 'mouseMoved'
-          await entry.cdp.send('Input.dispatchMouseEvent', {
-            type,
-            x: Number(event.x) || 0,
-            y: Number(event.y) || 0,
-            button: event.button === 'right' ? 'right' : event.button === 'middle' ? 'middle' : type === 'mouseMoved' ? 'none' : 'left',
-            buttons: Number(event.buttons ?? (type === 'mouseMoved' ? 0 : 1)),
-            clickCount: type === 'mouseMoved' ? 0 : 1,
-            modifiers: Number(event.modifiers ?? 0),
-          })
-        } else if (kind === 'wheel') {
-          await entry.cdp.send('Input.dispatchMouseEvent', {
-            type: 'mouseWheel',
-            x: Number(event.x) || 0,
-            y: Number(event.y) || 0,
-            deltaX: Number(event.deltaX) || 0,
-            deltaY: Number(event.deltaY) || 0,
-            modifiers: Number(event.modifiers ?? 0),
-          })
-        } else if (kind === 'key') {
-          const keyCode = Number(event.keyCode) || 0
-          const text = typeof event.text === 'string' && event.text !== '' ? event.text : undefined
-          await entry.cdp.send('Input.dispatchKeyEvent', {
-            type: event.type === 'up' ? 'keyUp' : text === undefined ? 'rawKeyDown' : 'keyDown',
-            key: String(event.key ?? ''),
-            code: String(event.code ?? ''),
-            ...keyCode > 0 ? { windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode } : {},
-            modifiers: Number(event.modifiers ?? 0),
-            ...text === undefined ? {} : { text, unmodifiedText: text },
-          })
-        } else if (kind === 'insertText') {
-          const text = String(event.text ?? '')
-          if (text !== '') await entry.cdp.send('Input.insertText', { text })
-        } else if (kind === 'compose') {
-          const text = String(event.text ?? '')
-          await entry.cdp.send('Input.imeSetComposition', {
-            text,
-            selectionStart: Number(event.selectionStart ?? text.length),
-            selectionEnd: Number(event.selectionEnd ?? text.length),
-          })
-        }
-      } catch (error) {
-        ctx.logger?.warn?.('ds-bot-web-browser: input failed: %s', error?.message ?? error)
-      }
-    }
-    entry.lastUsed = Date.now()
+    await host.input(botId, events)
   }
 
   // ---- HTTP ops ----------------------------------------------------------
@@ -543,9 +294,9 @@ async function start(ctx, config) {
         chrome: executablePath,
         capture,
         stateRoot,
-        bots: [...bots.keys()],
-        headed: headedMode(),
-        displays: [...displays.entries()].map(([id, entry]) => [id, entry.number]),
+        bots: host.list(),
+        display: host.display === undefined ? null : `:${host.display.number}`,
+        headed: true,
         channels: [...channels.entries()].map(([id, channel]) => [id, {
           agent: channel.agent !== undefined,
           viewers: channel.viewers.size,
@@ -581,58 +332,68 @@ async function start(ctx, config) {
     }
 
     const CREATES = new Set(['open', 'ensure', 'navigate', 'input', 'reload', 'back', 'forward', 'capture'])
-    const entry = CREATES.has(op) ? await botFor(botId, body?.viewport) : bots.get(botId)
-    if (entry === undefined) return respond({ ok: false, error: 'This Bot has no browser open. Load a page in its panel first.' })
+    if (CREATES.has(op)) {
+      await botFor(botId)
+      bots.set(botId, { lastUsed: Date.now() })
+    } else if (!bots.has(botId)) {
+      return respond({ ok: false, error: 'This Bot has no browser open. Load a page in its panel first.' })
+    }
+    const entry = bots.get(botId)
     entry.lastUsed = Date.now()
 
     if (op === 'open') {
       const state = typeof body?.url === 'string' && body.url !== '' && body.url !== 'about:blank'
-        ? await navigate(entry, body.url)
-        : { url: entry.page.url(), title: await entry.page.title().catch(() => '') }
-      await startCapture(botId, entry, String(body?.wsUrl ?? '')).catch((error) => {
-        ctx.logger?.warn?.('ds-bot-web-browser: capture did not start: %s', error?.message ?? error)
+        ? await navigate(botId, body.url)
+        : { url: await host.read(botId, 'location.href').catch(() => 'about:blank'), title: '' }
+      let captureError
+      await startCapture(botId, String(body?.wsUrl ?? '')).catch((error) => {
+        captureError = String(error?.message ?? error)
+        ctx.logger?.warn?.('ds-bot-web-browser: capture did not start: %s', captureError)
       })
-      return respond({ ok: true, ...state, live: true, window: { width: entry.view.width, height: entry.view.height } })
+      return respond({ ok: true, ...state, live: true, captureError, window: captureSize })
     }
     if (op === 'ensure') {
       const wanted = typeof body?.url === 'string' ? body.url : ''
-      const blank = entry.page.url() === 'about:blank'
-      const state = blank && wanted !== '' && wanted !== 'about:blank'
-        ? await navigate(entry, wanted)
-        : { url: entry.page.url(), title: await entry.page.title().catch(() => '') }
-      await startCapture(botId, entry, String(body?.wsUrl ?? '')).catch((error) => {
-        ctx.logger?.warn?.('ds-bot-web-browser: capture did not start: %s', error?.message ?? error)
+      const current = await host.read(botId, 'location.href').catch(() => 'about:blank')
+      const state = current === 'about:blank' && wanted !== '' && wanted !== 'about:blank'
+        ? await navigate(botId, wanted)
+        : { url: current, title: await host.read(botId, 'document.title').catch(() => '') }
+      let captureError
+      await startCapture(botId, String(body?.wsUrl ?? '')).catch((error) => {
+        captureError = String(error?.message ?? error)
+        ctx.logger?.warn?.('ds-bot-web-browser: capture did not start: %s', captureError)
       })
-      return respond({ ok: true, ...state, window: { width: entry.view.width, height: entry.view.height } })
+      return respond({ ok: true, ...state, captureError, window: captureSize })
     }
-    if (op === 'navigate') return respond({ ok: true, ...await navigate(entry, body?.url) })
-    if (op === 'state') return respond({ ok: true, url: entry.page.url(), title: await entry.page.title().catch(() => ''), live: true })
+    if (op === 'navigate') return respond({ ok: true, ...await navigate(botId, body?.url) })
+    if (op === 'state') return respond({ ok: true, url: await host.read(botId, 'location.href').catch(() => ''), title: await host.read(botId, 'document.title').catch(() => ''), live: true })
     if (op === 'read') {
-      if (!/^https?:/i.test(entry.url)) return respond({ ok: false, error: 'No page is open in this browser tab.' })
+      const url = await host.read(botId, 'location.href').catch(() => '')
+      if (!/^https?:/i.test(url)) return respond({ ok: false, error: 'No page is open in this browser tab.' })
       const script = String(body?.script ?? '')
       if (script === '' || script.length > SCRIPT_MAX) return respond({ ok: false, error: 'The page script is missing or too large.' })
-      const result = await entry.cdp.send('Runtime.evaluate', { expression: script, returnByValue: true, awaitPromise: true, timeout: 10_000 })
-      if (result.exceptionDetails !== undefined) {
-        const text = result.exceptionDetails.exception?.description ?? result.exceptionDetails.text ?? 'The page script failed.'
-        return respond({ ok: false, error: String(text).slice(0, 300) })
+      try {
+        return respond({ ok: true, page: await host.read(botId, script) })
+      } catch (error) {
+        return respond({ ok: false, error: String(error?.message ?? error).slice(0, 300) })
       }
-      return respond({ ok: true, page: result.result?.value })
     }
     if (op === 'input') {
       await applyInput(botId, body?.events)
       return respond({ ok: true })
     }
     if (op === 'reload') {
-      await entry.page.reload({ waitUntil: 'domcontentloaded', timeout: 25_000 }).catch(() => {})
-      return respond({ ok: true, url: entry.page.url(), title: await entry.page.title().catch(() => '') })
+      await host.read(botId, 'location.reload()').catch(() => {})
+      return respond({ ok: true, url: await host.read(botId, 'location.href').catch(() => ''), title: await host.read(botId, 'document.title').catch(() => '') })
     }
     if (op === 'back' || op === 'forward') {
-      await (op === 'back' ? entry.page.goBack({ timeout: 20_000 }) : entry.page.goForward({ timeout: 20_000 })).catch(() => {})
-      return respond({ ok: true, url: entry.page.url(), title: await entry.page.title().catch(() => '') })
+      await host.read(botId, `history.${op}()`).catch(() => {})
+      return respond({ ok: true, url: await host.read(botId, 'location.href').catch(() => ''), title: await host.read(botId, 'document.title').catch(() => '') })
     }
     if (op === 'capture') {
-      await startCapture(botId, entry, String(body?.wsUrl ?? ''))
-      return respond({ ok: true, capture: channelOf(botId).agent !== undefined, format: channelOf(botId).format ?? null })
+      let captureError
+      await startCapture(botId, String(body?.wsUrl ?? '')).catch((error) => { captureError = String(error?.message ?? error) })
+      return respond({ ok: true, capture: channelOf(botId).agent !== undefined, captureError, format: channelOf(botId).format ?? null })
     }
     return respond({ ok: false, error: `Unknown op "${op}".` })
   }
@@ -663,10 +424,8 @@ async function start(ctx, config) {
     try {
       const now = Date.now()
       // A display whose Bot is gone must not outlive it.
-      for (const botId of [...displays.keys()]) {
-        if (!bots.has(botId)) stopDisplay(botId)
-      }
-      for (const [botId, entry] of [...bots]) {
+      for (const botId of [...bots.keys()]) {
+        const entry = bots.get(botId)
         const channel = channels.get(botId)
         if (channel !== undefined && channel.viewers.size > 0) continue
         if (now - entry.lastUsed < idleMs) continue
@@ -682,15 +441,13 @@ async function start(ctx, config) {
   ctx.effect(() => () => {
     clearInterval(sweeper)
     return (async () => {
-      for (const botId of [...bots.keys()]) await closeBot(botId)
-      for (const botId of [...displays.keys()]) stopDisplay(botId)
+      await host.stop()
       for (const channel of channels.values()) {
         try { channel.agent?.close() } catch {}
       }
       channels.clear()
       tickets.clear()
       wss.close()
-      await new Promise((resolve) => agentServer.close(() => resolve(undefined)))
     })()
   }, 'ds-bot-web-browser: browsers')
 

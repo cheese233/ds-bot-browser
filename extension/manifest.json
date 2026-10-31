@@ -1,0 +1,9 @@
+{
+  "manifest_version": 3,
+  "name": "DS Bot tab capture",
+  "version": "1.0.0",
+  "description": "Captures this Bot's tab for its browser panel.",
+  "background": { "service_worker": "sw.js" },
+  "action": {},
+  "permissions": ["tabCapture", "activeTab", "tabs", "offscreen"]
+}

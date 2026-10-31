@@ -10,13 +10,15 @@ every Web page, before the app shell, and backs it on the host.
 
 ## What the panel is
 
-* **One real Chromium per Bot**, headed, on its own Xvfb display. Each Bot has
-  a private screen, its own profile directory (`state/browser/<botId>`), so
+* **One real Chromium per Bot**, headed, on one shared Xvfb display. Each Bot
+  gets its own tab and profile directory (`state/browser/<botId>`), so
   cookies/localStorage are per Bot and survive restarts.
-* **Real video, not JPEG polling.** Inside that browser the page captures its
-  own display (`getDisplayMedia` -> `MediaRecorder`) and pushes encoded chunks
-  over one WebSocket; the panel plays them with MSE. The same socket carries
-  mouse, wheel, keyboard and IME input back.
+* **Real video, not JPEG polling.** A bundled extension grabs the Bot's tab
+  (`chrome.tabCapture.getMediaStreamId`, made invokable through CDP
+  `Extensions.triggerAction`), an offscreen document wires it to
+  `MediaRecorder`, and the encoded chunks go over one WebSocket; the panel
+  plays them with MSE. The same socket carries mouse, wheel, keyboard and IME
+  input back.
 * **The Bot reads the same page.** `read_browser` is answered with
   `Runtime.evaluate` over CDP on that very page, so what the Bot reads is what
   the user sees.
@@ -27,10 +29,10 @@ every Web page, before the app shell, and backs it on the host.
 ## Requirements
 
 * `dsh` with a Web profile.
-* **`xvfb`** (`apt install xvfb`) — required for the shipped configuration:
-  without an X display, Chromium's ANGLE/GL backend cannot start and WebGL
-  falls back to SwiftShader. `DS_BOT_WEB_HEADLESS=1` runs without Xvfb for
-  comparison; that row is SwiftShader and its UA needs the override.
+* **`xvfb`** (`apt install xvfb`) — required: the capture path drives a headed
+  Chromium, and without an X display Chromium's ANGLE/GL backend falls back to
+  SwiftShader. Never pass `--use-fake-device-for-media-stream`: with it Chrome
+  returns a green test pattern instead of the page.
 * **Chromium/Chrome** (`google-chrome-stable` or set `executablePath`).
 * Node.js 22+.
 
@@ -69,16 +71,15 @@ every Web page, before the app shell, and backs it on the host.
 
 | item | value |
 |---|---|
-| WebGL renderer (shipped: Xvfb + `--headless=new` + GL flags) | `ANGLE (Mesa, llvmpipe (LLVM 21.1.8 256 bits), OpenGL 4.5)` |
-| WebGL renderer with `DS_BOT_WEB_HEADLESS=1` (no Xvfb) | `ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero)), SwiftShader driver)` |
+| WebGL renderer (headed on Xvfb + GL flags) | `ANGLE (Mesa, llvmpipe (LLVM 21.1.8 256 bits), OpenGL 4.5)` |
 | `navigator.webdriver` | `false` (rebrowser `AutomationControlled` patch) |
 | User agent | `Chrome/156.0.0.0`, no `HeadlessChrome` (overridden; brands stay Chromium/Google Chrome 156) |
 | `screen` / `outerWidth` | 800×600 / 800×600 (see the residual tells below) |
-| Capture / encoded video | 800×600 capture, 800×450 encoded @30 fps |
+| Capture / encoded video | 800×600 capture and encode @30 fps (tab source, no cropping) |
 | Codec chosen | `video/webm;codecs=vp8` (MSE-safe); MP4/H.264 is offered but MediaRecorder's MP4 did not demux in MSE in testing |
 | Bitrate under motion | 283–311 kbps (~3.5 chunks/s) — against CDP JPEG at several MB/s |
 | Panel render rate | 8.5–10.8 fps measured (only when the page changes; a static page holds its last frame) |
-| Memory, two Bots open | Chromium ≈ 826 MiB PSS, Xvfb ≈ 30 MiB PSS |
+| Memory, two Bots open | Chromium ≈ 728 MiB PSS, one shared Xvfb ≈ 48 MiB PSS |
 
 ## Text input
 
@@ -113,8 +114,9 @@ One line in `cordis.patch.yml` changes it, hot-reloaded.
 ## Layout
 
 ```
-index.js            host half: Xvfb, per-Bot Chromium, CDP, WebSocket hub, routes
-agent.html          in-browser capture agent (getDisplayMedia -> MediaRecorder -> WS)
+index.js            host half: routes, bridge injection, WebSocket hub
+browser.js          Xvfb + per-Bot headed Chromium over raw CDP, tabCapture pipeline
+extension/          MV3 extension: tabCapture -> offscreen -> MediaRecorder -> WS
 bridge-video.js     injected bridge: MSE player + input over WebSocket
 bridge-canvas.js    canvas fallback bridge
 bridge.js           iframe fallback bridge
